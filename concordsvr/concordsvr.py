@@ -22,7 +22,9 @@ import time
 import asyncore, asynchat
 import socket
 import time
+import datetime
 from threading import Thread
+from threading import Timer
 from collections import deque
 import datetime
 import traceback
@@ -35,6 +37,7 @@ import requests
 import ConfigParser
 from concord import concord, concord_commands, concord_alarm_codes
 from concord.concord_commands import STAR, HASH, TRIPPED, FAULTED, ALARM, TROUBLE, BYPASSED
+import notifications
 
 log = logging.getLogger('root')
 version = 2.0
@@ -88,33 +91,6 @@ def logger(message, level = 'info'):
     elif 'warn' in level:
         log.warn(message)
 
-
-#
-# Send e-mail over GMAIL
-#
-def send_email(user, pwd, recipient, subject, body):
-    import smtplib
-
-    gmail_user = user
-    gmail_pwd = pwd
-    FROM = user
-    TO = recipient if type(recipient) is list else [recipient]
-    SUBJECT = subject
-    TEXT = body
-
-    # Prepare actual message
-    message = """From: %s\nTo: %s\nSubject: %s\n\n%s
-    """ % (FROM, ", ".join(TO), SUBJECT, TEXT)
-    try:
-        server_ssl = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-        server_ssl.ehlo()
-        server_ssl.login(gmail_user, gmail_pwd)
-        server_ssl.sendmail(FROM, TO, message)
-        server_ssl.close()
-        log.info("E-mail notification sent")
-    except Exception, ex:
-        log.error("E-mail notification failed to send: %s" % str(ex))
-
 def zonekey(zoneDev):
     """ Return internal key for supplied Indigo zone device. """
     #assert zoneDev.deviceTypeId == 'zone'
@@ -137,8 +113,12 @@ def isZoneErrState(state_list):
     return False
 
 def zoneStateChangedExceptTripped(old, new):
-    old = list(sorted(old)).remove(TRIPPED)
-    new = list(sorted(new)).remove(TRIPPED)
+    if TRIPPED in list(sorted(old)):
+        old = list(sorted(old)).remove(TRIPPED)
+    
+    if TRIPPED in list(sorted(new)):
+        new = list(sorted(new)).remove(TRIPPED)
+    
     return old != new
     
 
@@ -153,7 +133,8 @@ NO_DATA = '<NO DATA>'
 KEYPRESS_SILENT = [ 0x05 ]
 KEYPRESS_ARM_STAY = [ 0x28 ]
 KEYPRESS_ARM_AWAY = [ 0x27 ]
-KEYPRESS_ARM_STAY_LOUD = [ 0x02 ]
+#KEYPRESS_ARM_STAY_LOUD = [ 0x02 ]
+KEYPRESS_ARM_STAY_LOUD = [ 0x28, 0x04 ]
 KEYPRESS_ARM_AWAY_LOUD = [ 0x03 ]
 KEYPRESS_DISARM = [ 0x20 ]
 KEYPRESS_BYPASS = [ 0xb ] # '#'
@@ -238,6 +219,8 @@ class Concord4ServerConfig():
         self.CALLBACKURL_CONCORD_DEVICE_ID = self.read_config_var('main', 'callbackurl_concord_device_id', '', 'str')
 
         self.RESTAPIPW = self.read_config_var('main', 'rest_api_auth_password', '', 'str')
+        self.NORMAL_TO_ADDRESSES = self.read_config_var('email', 'normalNotificationList', '', 'str').split(",")
+        self.ALARM_TO_ADDRESSES = self.read_config_var('email', 'alarmNotificationList', '', 'str').split(",")
 
 
     def defaulting(self, section, variable, default, quiet = False):
@@ -301,7 +284,10 @@ class ConcordSvr(object):
         self.errLog = deque()
         self.eventLogDays = 0
         self.errLogDays = 0
-
+        self.statusEmailString=""
+        self.statusEmailTimer = None
+        self.isStatusEmailTimerRunning = False
+        self.whenWasItLastArmed = None
     #
     # Internal event log
     #
@@ -315,18 +301,77 @@ class ConcordSvr(object):
             else:
                 break
 
+    def send_the_status_email(self):
+        theSubject = "Alarm System Zone Summary"
+        timeDifference = datetime.datetime.now() - self.whenWasItLastArmed
+        
+        if timeDifference.total_seconds() > 300:
+            theSubject = "Arriving Home"
+        else:
+            theSubject = "Leaving Home"
+
+        self.statusEmailString += "-Seconds since armed: " + str(timeDifference.total_seconds())
+
+        #don't send the email if its a status update
+        if "Tripped" in self.statusEmailString:
+            notifications.send_the_email(config.NORMAL_TO_ADDRESSES, theSubject, self.statusEmailString)
+
+        #clear status string
+        self.statusEmailString=""
+        self.isStatusEmailTimerRunning = False
+
+    def add_to_status_email_queue(self, zoneString, message):
+        self.statusEmailString += "###Enter/Exit while armed/arming### : Zone " + zoneString + ". " + message + "\n"
+
+        # if timer isn't running, start it
+        if not  self.isStatusEmailTimerRunning:
+            self.isStatusEmailTimerRunning = True
+            t = Timer(180, self.send_the_status_email)
+            t.start();
+
     def logEvent(self, eventInfo, isErr=False):
         event_time = datetime.datetime.now()
         self._logEvent(eventInfo, event_time, self.eventLog, self.eventLogDays)
 
+        log.info("logEvent:" + str(eventInfo))
+        
         # Send an e-mail if we're armed and we have a zone update
         # This would mean the alarm has detected something
-        if self.armed and 'zone_name' in eventInfo:
-            email_subject = "--- ALARM EVENT: ZONE " + eventInfo['zone_name']
-            email_message = "NEW STATE: " + str(eventInfo['zone_state']) + "\nPREVIOUS STATE: " + str(eventInfo['prev_zone_state']) + "\nCOMMAND: " + str(eventInfo['command'] + "\nDATE: " + str(event_time))
+        if self.armed and ('zone_name' in eventInfo or ('alarm_general_type' in eventInfo and eventInfo['alarm_general_type'] == 'Alarm')):
+            if 'zone_name' in eventInfo:
+                zoneString = eventInfo['zone_name']
+                currentZoneStateString = str(eventInfo['zone_state'])
+                prevZoneStateString = str(eventInfo['prev_zone_state'])
+                commandString = str(eventInfo['command'])
+
+                theSubject = "###Enter/Exit while armed/arming### : Zone " + zoneString
+                theMessage = "Door is now shut."
+                if "Tripped" in currentZoneStateString:
+                        theMessage = "Door was opened"
+
+                if "Alarm" in currentZoneStateString:
+                    if "Tripped" in currentZoneStateString:
+                            theMessage = "Alarm in progress!"
+                            theSubject = "!!!ALARM!!! : Zone " + zoneString
+                    elif "Bypassed" in currentZoneStateString:
+                            theMessage = "Alarm was cancelled"
+                            theSubject = "!!!ALARM Cancelled!!! : Zone " + zoneString
+
+                theMessage += "\nC:" + currentZoneStateString + "\nP:" + prevZoneStateString
+            
+            if 'alarm_general_type' in eventInfo and eventInfo['alarm_general_type'] == 'Alarm':
+                theMessage = "Alarm in progress!"
+                theSubject = "!!!ALARM!!!"
+                            
+            email_subject = theSubject
+            email_message = theMessage
             log.info("Sending Email... ")
-            log.debug("Email Contents:" + email_subject + "\n" + email_message)
-            send_email("my_send_email_as_base_64@gmail.com".decode('base64'), "my_password_as_base_64".decode('base64'), "target_email_as_base_64@somewhere.com".decode('base64'), email_subject, email_message)
+            log.error("Email Contents:" + email_subject + "\n" + email_message)
+                        
+            if "!!!ALARM" in email_subject:
+               notifications.send_the_email(config.ALARM_TO_ADDRESSES, email_subject, email_message)
+            else:
+               self.add_to_status_email_queue(zoneString, email_message)
 
         if isErr:
             self._logEvent(eventInfo, event_time, self.errLog, self.errLogDays)
@@ -411,7 +456,7 @@ class ConcordSvr(object):
         log.info("Concord4 Arm/Disarm to %s, bypass=%s, silent=%s" % (action, str(bypasszone), str(arm_silent)))
 
         can_arm, reason = self.isReadyToArm(partition_num)
-        can_arm, reason = self.isReadyToArm(partition_num)
+        #can_arm, reason = self.isReadyToArm(partition_num)
         if not can_arm:
             errors['partition'] = reason
             log.error('Panel not ready to arm')
@@ -640,6 +685,7 @@ class ConcordSvr(object):
                 st_request.start()
             elif int(msg['arming_level_code']) == 2:
                 log.info('System is ARMED to STAY')
+                self.whenWasItLastArmed = datetime.datetime.now()
                 self.armed = True
                 self.updateStateOnServer('armstatus','arm_level','armed_stay')
                 delay = (self.event_send_time - int(time.time()))+1
@@ -649,6 +695,7 @@ class ConcordSvr(object):
                 st_request.start()
             elif int(msg['arming_level_code']) == 3:
                 log.info('System is ARMED to AWAY')
+                self.whenWasItLastArmed = datetime.datetime.now()
                 self.armed = True
                 delay = (self.event_send_time - int(time.time()))+1
                 if delay < 0:
@@ -721,8 +768,10 @@ class ConcordSvr(object):
             alarm_desc = "%s / %s" % (msg['alarm_general_type'], msg['alarm_specific_type'])
             event_data = msg['event_specific_data']
 
+            log.info("msg:" + str(msg))
             # We really only care if its of gen type 1 (fire,police, etc)
-            if msg['alarm_general_type_code'] == '1':
+            #if msg['alarm_general_type_code'] == '1':
+            if msg['alarm_general_type_code'] == 1:
                 zk = (part_num, source_num)
                 if source_type == 'Zone' and zk in self.zones:
                     zone_name = self.zones[zk].get('zone_text', 'Unknown')
@@ -770,7 +819,7 @@ class PanelConcurrentThread(Thread):
                     time.sleep(1)
                 self.panel.message_loop()
 
-        except self.StopThread:
+        except:
             log.debug("Got StopThread in runConcurrentThread()")
             pass
 
@@ -944,8 +993,10 @@ class ConcordHTTPServer(asyncore.dispatcher,Thread):
                     concord_interface.ArmDisarm(action='disarm')
                     channel.pushok(json.dumps({'response' : 'Disarm System...'}))
             elif '/concord/keypress' in path:
-                code = path.split('/')[-1]
-                concord_interface.send_key_press(key=[hex(int(code))])
+                #code = path.split('/')[-1]
+                #concord_interface.send_key_press(key=[hex(int(code))])
+                xcode = path.split('/')[-1]
+                concord_interface.send_key_press(code=[hex(int(xcode))])
                 channel.pushok(json.dumps({'response' : 'Sending Keypress...'}))
 
             else:
